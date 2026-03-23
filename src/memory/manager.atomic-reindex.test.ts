@@ -2,41 +2,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { getMemorySearchManager, type MemoryIndexManager } from "./index.js";
+import type { OpenClawConfig } from "../config/config.js";
+import type { MemoryIndexManager } from "./index.js";
 
 let shouldFail = false;
 
-vi.mock("chokidar", () => ({
-  default: {
-    watch: vi.fn(() => ({
-      on: vi.fn(),
-      close: vi.fn(async () => undefined),
-    })),
-  },
-}));
-
-vi.mock("./embeddings.js", () => {
-  return {
-    createEmbeddingProvider: async () => ({
-      requestedProvider: "openai",
-      provider: {
-        id: "mock",
-        model: "mock-embed",
-        embedQuery: async () => [1, 0, 0],
-        embedBatch: async (texts: string[]) => {
-          if (shouldFail) {
-            throw new Error("embedding failure");
-          }
-          return texts.map((_, index) => [index + 1, 0, 0]);
-        },
-      },
-    }),
-  };
-});
-
-vi.mock("./sqlite-vec.js", () => ({
-  loadSqliteVecExtension: async () => ({ ok: false, error: "sqlite-vec disabled in tests" }),
-}));
+type EmbeddingTestMocksModule = typeof import("./embedding.test-mocks.js");
+type TestManagerHelpersModule = typeof import("./test-manager-helpers.js");
+type MemoryIndexModule = typeof import("./index.js");
 
 describe("memory manager atomic reindex", () => {
   let fixtureRoot = "";
@@ -44,14 +17,30 @@ describe("memory manager atomic reindex", () => {
   let workspaceDir: string;
   let indexPath: string;
   let manager: MemoryIndexManager | null = null;
+  let embedBatch: ReturnType<EmbeddingTestMocksModule["getEmbedBatchMock"]>;
+  let resetEmbeddingMocks: EmbeddingTestMocksModule["resetEmbeddingMocks"];
+  let getRequiredMemoryIndexManager: TestManagerHelpersModule["getRequiredMemoryIndexManager"];
+  let closeAllMemorySearchManagers: MemoryIndexModule["closeAllMemorySearchManagers"];
 
   beforeAll(async () => {
     fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-mem-atomic-"));
+    const embeddingMocks = await import("./embedding.test-mocks.js");
+    embedBatch = embeddingMocks.getEmbedBatchMock();
+    resetEmbeddingMocks = embeddingMocks.resetEmbeddingMocks;
+    ({ getRequiredMemoryIndexManager } = await import("./test-manager-helpers.js"));
+    ({ closeAllMemorySearchManagers } = await import("./index.js"));
   });
 
   beforeEach(async () => {
     vi.stubEnv("OPENCLAW_TEST_MEMORY_UNSAFE_REINDEX", "0");
+    resetEmbeddingMocks();
     shouldFail = false;
+    embedBatch.mockImplementation(async (texts: string[]) => {
+      if (shouldFail) {
+        throw new Error("embedding failure");
+      }
+      return texts.map((_, index) => [index + 1, 0, 0]);
+    });
     workspaceDir = path.join(fixtureRoot, `case-${caseId++}`);
     await fs.mkdir(workspaceDir, { recursive: true });
     indexPath = path.join(workspaceDir, "index.sqlite");
@@ -64,6 +53,8 @@ describe("memory manager atomic reindex", () => {
       await manager.close();
       manager = null;
     }
+    await closeAllMemorySearchManagers();
+    vi.unstubAllEnvs();
   });
 
   afterAll(async () => {
@@ -90,14 +81,9 @@ describe("memory manager atomic reindex", () => {
         },
         list: [{ id: "main", default: true }],
       },
-    };
+    } as OpenClawConfig;
 
-    const result = await getMemorySearchManager({ cfg, agentId: "main" });
-    expect(result.manager).not.toBeNull();
-    if (!result.manager) {
-      throw new Error("manager missing");
-    }
-    manager = result.manager;
+    manager = await getRequiredMemoryIndexManager({ cfg, agentId: "main" });
 
     await manager.sync({ force: true });
     const beforeStatus = manager.status();
